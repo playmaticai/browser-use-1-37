@@ -445,7 +445,57 @@ class Agent:
 		elif self.tool_calling_method is None:
 			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
 			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
-			parsed: AgentOutput | None = response['parsed']
+			
+			# Handle the case where Gemini returns a list in the content field
+			if response['parsed'] is None and 'raw' in response and hasattr(response['raw'], 'content'):
+				try:
+					# Check if content is a list with JSON string as second element
+					if isinstance(response['raw'].content, list) and len(response['raw'].content) > 1:
+						# Extract JSON from the second element if it starts with ```json
+						json_content = response['raw'].content[1]
+						if isinstance(json_content, str) and json_content.startswith('```json'):
+							# Extract the JSON part
+							json_str = json_content.split('```json\n', 1)[1].rsplit('```', 1)[0]
+							
+							# Fix invalid escape sequences before parsing
+							json_str = json_str.replace("\\'", "'")  # Replace escaped single quotes
+							
+							# There might be other problematic escapes, handle them too
+							# We'll use a regex-based approach to fix common issues
+							import re
+							# Replace escaped sequences within JSON strings that might be problematic
+							# This regex finds strings (between quotes) and fixes escapes within them
+							def fix_escapes(match):
+								s = match.group(0)
+								# Fix various escape sequences that might be invalid in JSON
+								s = s.replace("\\'", "'")  # Replace \' with '
+								s = s.replace('\\\"', '\\"')  # Ensure \" is formatted correctly
+								return s
+							
+							# Apply the fix to all strings in the JSON
+							json_str = re.sub(r'"(?:\\.|[^"\\])*"', fix_escapes, json_str)
+							
+							try:
+								# First try to parse with json module
+								import json
+								parsed_json = json.loads(json_str)
+							except json.JSONDecodeError as e:
+								logger.warning(f"JSON parsing failed: {e}")
+								# Fall back to the message_manager's method
+								parsed_json = self.message_manager.extract_json_from_model_output(json_str)
+							
+							parsed = self.AgentOutput(**parsed_json)
+							logger.info(f"Successfully parsed JSON from Gemini response")
+						else:
+							raise ValueError('Could not extract JSON from Gemini response')
+					else:
+						raise ValueError('Unexpected Gemini response format')
+				except (ValueError, ValidationError) as e:
+					logger.warning(f'Failed to parse model output from Gemini: {str(e)}')
+					raise ValueError(f'Could not parse Gemini response: {str(e)}')
+			else:
+				parsed: AgentOutput | None = response['parsed']
+
 		else:
 			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True, method=self.tool_calling_method)
 			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
